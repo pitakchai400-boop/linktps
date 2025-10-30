@@ -1,0 +1,1270 @@
+<!DOCTYPE html>
+<html lang="th">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>ระบบประมวลภาพกิจกรรม</title>
+    
+    <!-- 1. Tailwind CSS -->
+    <script src="https://cdn.tailwindcss.com"></script>
+    
+    <!-- 2. Google Font 'Sarabun' -->
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Sarabun:wght@400;600;700&display=swap" rel="stylesheet">
+    
+    <!-- 3. React & ReactDOM -->
+    <script src="https://unpkg.com/react@18/umd/react.development.js" crossorigin></script>
+    <script src="https://unpkg.com/react-dom@18/umd/react-dom.development.js" crossorigin></script>
+    
+    <!-- 4. Babel (for JSX) -->
+    <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+
+    <style>
+      /* ใช้ฟอนต์ Sarabun เป็นหลัก */
+      body {
+        font-family: 'Sarabun';
+        background-color: #E0F7FA; /* สีพื้นหลังจาก React */
+      }
+    </style>
+</head>
+<body>
+    
+    <!-- Root element ที่ React จะ mount -->
+    <div id="root"></div>
+
+    <!-- 5. React App Code (Babel will transpile this) -->
+    <script type="text/babel">
+      
+      // ดึง hooks จาก Global React object
+      const { useState, useEffect, useMemo, useCallback } = React;
+
+      // --- ค่าคงที่ ---
+      // URL นี้ต้องเป็น URL ที่ได้จากการ Deploy Google Apps Script (GAS)
+      const GAS_URL = "https://script.google.com/macros/s/AKfycbx1zybKVyE2IUaS06lwD7H-FMxHviswFDYSCODezUXH2Vh6o0iCwGXOy29RIk2FXtA/exec";
+      const ITEMS_PER_PAGE = 25;
+      const CURRENT_BE_YEAR = new Date().getFullYear() + 543;
+      const YEAR_OPTIONS = Array.from({ length: 10 }, (_, i) => CURRENT_BE_YEAR - i);
+
+      // --- ฟังก์ชันตัวช่วย ---
+
+      /**
+       * แปลง Google Drive View URL เป็น Direct Content URL
+       * @param {string} url - URL จาก Google Drive (เช่น .../file/d/FILE_ID/view)
+       * @returns {string} - URL สำหรับแสดงผลในแท็ก <img>
+       */
+      const convertGoogleDriveUrl = (url) => {
+        if (!url || typeof url !== 'string') {
+          return null;
+        }
+        // ใช้ Regular Expression เพื่อดึง File ID
+        const fileIdMatch = url.match(/file\/d\/(.*?)\//);
+        if (fileIdMatch && fileIdMatch[1]) {
+          const fileId = fileIdMatch[1];
+          // ใช้ URL format นี้ซึ่งมักจะเสถียรสำหรับ <img>
+          return `https://lh3.googleusercontent.com/d/${fileId}`;
+        }
+        
+        // ลองอีกรูปแบบเผื่อเป็น URL ที่แชร์โดยตรง
+        const idMatch = url.match(/id=([^&]+)/);
+        if (idMatch && idMatch[1]) {
+           return `https://lh3.googleusercontent.com/d/${idMatch[1]}`;
+        }
+
+        // ถ้าไม่ตรงรูปแบบเลย ให้ส่งค่าเดิมกลับ (อาจจะไม่แสดงผล)
+        return url;
+      };
+
+      /**
+       * ปรับขนาดรูปภาพ (client-side)
+       * @param {File} file - ไฟล์รูปภาพ
+       * @param {number} width - ความกว้างที่ต้องการ
+       * @param {number} height - ความสูงที่ต้องการ
+       * @returns {Promise<string>} - Promise ที่ resolve เป็น base64 string
+       */
+      const resizeImage = (file, width, height) => {
+        return new Promise((resolve, reject) => {
+          const reader = new FileReader();
+          reader.readAsDataURL(file);
+          reader.onerror = reject;
+          reader.onload = (event) => {
+            const img = new Image();
+            img.src = event.target.result;
+            img.onerror = reject;
+            img.onload = () => {
+              const canvas = document.createElement('canvas');
+              const ctx = canvas.getContext('2d');
+
+              // ปรับขนาดโดยคงอัตราส่วน, ให้ความกว้างสูงสุด 400px
+              // หรือใช้ขนาดเดิมถ้าเล็กกว่า
+              const maxWidth = width; // e.g., 400
+              if (img.width <= maxWidth) {
+                // ใช้ขนาดเดิม
+                canvas.width = img.width;
+                canvas.height = img.height;
+              } else {
+                // คำนวณความสูงใหม่
+                const ratio = maxWidth / img.width;
+                canvas.width = maxWidth;
+                canvas.height = img.height * ratio;
+              }
+              
+              ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
+              resolve(canvas.toDataURL(file.type));
+            };
+          };
+        });
+      };
+
+      /**
+       * จัดรูปแบบวันที่เป็นภาษาไทย
+       * @param {string} isoDate - วันที่ (เช่น "2025-10-29")
+       * @returns {string} - (เช่น "29 ตุลาคม 2568")
+       */
+      const formatThaiDate = (isoDate) => {
+        if (!isoDate) return "-";
+        try {
+          const date = new Date(isoDate);
+          return date.toLocaleDateString('th-TH', {
+            day: 'numeric',
+            month: 'long',
+            year: 'numeric',
+          });
+        } catch (error) {
+          console.error("Format date error:", error);
+          return isoDate;
+        }
+      };
+
+      // --- Components ---
+
+      // Component: Spinner
+      const LoadingSpinner = () => (
+        <div className="flex justify-center items-center my-10">
+          <div className="animate-spin rounded-full h-12 w-12 border-b-4 border-blue-500"></div>
+          <span className="ml-4 text-lg">กำลังโหลด...</span>
+        </div>
+      );
+
+      // Component: Simple Modal (แทน SweetAlert)
+      const SimpleModal = ({ modal, setModal }) => {
+        if (!modal.show) return null;
+
+        const { title, text, icon, onConfirm, onCancel, showConfirm, showCancel } = modal;
+
+        const closeModal = () => {
+          setModal({ ...modal, show: false });
+        };
+
+        const handleConfirm = () => {
+          if (onConfirm) onConfirm();
+          closeModal();
+        };
+
+        const handleCancel = () => {
+          if (onCancel) onCancel();
+          closeModal();
+        };
+
+        const getIcon = () => {
+          switch (icon) {
+            case 'success': return '✅';
+            case 'error': return '❌';
+            case 'warning': return '⚠️';
+            default: return 'ℹ️';
+          }
+        };
+
+        return (
+          <div className="fixed inset-0 z-50 flex items-center justify-center bg-black bg-opacity-50 transition-opacity">
+            <div className="bg-white rounded-lg shadow-xl w-full max-w-md m-4 p-6 transition-transform transform scale-100">
+              <div className="text-center">
+                <span className="text-4xl mb-4 inline-block">{getIcon()}</span>
+                <h3 className="text-2xl font-bold text-gray-800 mb-2">{title}</h3>
+                <p className="text-gray-600 mb-6">{text}</p>
+              </div>
+              <div className="flex justify-center gap-4">
+                {showCancel && (
+                  <button
+                    onClick={handleCancel}
+                    className="px-6 py-2 bg-gray-300 text-gray-800 font-semibold rounded-lg shadow-md hover:bg-gray-400 transition-colors"
+                  >
+                    {modal.cancelButtonText || 'ยกเลิก'}
+                  </button>
+                )}
+                {showConfirm && (
+                  <button
+                    onClick={handleConfirm}
+                    className={`px-6 py-2 text-white font-semibold rounded-lg shadow-md transition-colors ${
+                      icon === 'error' || icon === 'warning' ? 'bg-red-500 hover:bg-red-600' : 'bg-blue-600 hover:bg-blue-700'
+                    }`}
+                  >
+                    {modal.confirmButtonText || 'ตกลง'}
+                  </button>
+                )}
+              </div>
+            </div>
+          </div>
+        );
+      };
+
+      // Component: การ์ดกิจกรรมล่าสุด (ใหม่)
+      const ActivityCard = ({ activity }) => {
+        const imageUrl = useMemo(() => convertGoogleDriveUrl(activity.coverImageUrl), [activity.coverImageUrl]);
+        
+        return (
+          <a 
+            href={activity.link} 
+            target="_blank" 
+            rel="noopener noreferrer" 
+            className="block bg-white rounded-lg shadow-lg overflow-hidden transition-transform transform hover:-translate-y-1 hover:shadow-xl duration-300"
+          >
+            <img 
+              src={imageUrl || 'https://placehold.co/400x300/E0F7FA/212121?text=TPS+Activity'} 
+              alt={`ปก ${activity.name}`}
+              className="w-full h-48 object-cover" // Fixed height for grid consistency
+              onError={(e) => { e.target.src = 'https://placehold.co/400x300/E0F7FA/212121?text=Image+Error'; }}
+            />
+            <div className="p-4">
+              <h4 
+                className="font-semibold text-md text-gray-800 truncate" 
+                title={activity.name}
+              >
+                {activity.name}
+              </h4>
+              <p className="text-sm text-gray-500 mt-1">
+                {formatThaiDate(activity.date)}
+              </p>
+            </div>
+          </a>
+        );
+      };
+
+
+      // Component: แถวในตาราง
+      const ActivityRow = ({ activity, isAdmin, onEdit, onDelete }) => {
+        const [showImage, setShowImage] = useState(false);
+        const imageUrl = useMemo(() => convertGoogleDriveUrl(activity.coverImageUrl), [activity.coverImageUrl]);
+
+        {/* --- 1. หุ้มด้วย React.Fragment --- */}
+        return (
+          <React.Fragment>
+            {/* นี่คือแถวข้อมูลหลัก */}
+            <tr className="border-b border-gray-300 hover:bg-blue-100 transition-colors duration-150">
+              <td className="p-3 text-center align-top whitespace-nowrap">{formatThaiDate(activity.date)}</td>
+              {/* --- 1. ซ่อนคอลัมน์ 'ปี พ.ศ.' ถ้าไม่ใช่ Admin --- */}
+              {isAdmin && <td className="p-3 text-center align-top">{activity.beYear}</td>}
+              <td className="p-3 text-left align-top">
+                {/* 1. เพิ่ม <div className="min-w-0"> 
+                     เพื่อให้ flexbox/table สามารถย่อส่วนนี้ และ truncate ทำงานได้
+                */}
+                <div className="min-w-0">
+                  {/* --- FIX: ย้าย Comment มาไว้ตรงนี้ --- */}
+                  {/* 2. เพิ่ม block (เพื่อให้ truncate ทำงาน)
+                    3. เพิ่ม truncate (เพื่อแสดง ... เมื่อขนาดยาวเกิน)
+                    4. เพิ่ม title (เพื่อให้ user hover ดูชื่อเต็มได้)
+                  */}
+                  <a 
+                    href={activity.link} 
+                    target="_blank" 
+                    rel="noopener noreferrer" 
+                    className="text-blue-600 hover:text-blue-800 hover:underline block truncate"
+                    title={activity.name}
+                  >
+                    {activity.name}
+                  </a>
+                </div>
+              </td>
+              <td className="p-3 text-center align-middle">
+                {/* --- 2. ปุ่มนี้จะสลับการแสดงผลแถวใหม่ --- */}
+                <button
+                  onClick={() => setShowImage(!showImage)}
+                  className="bg-gray-200 hover:bg-gray-300 text-sm px-3 py-1 rounded-full shadow-sm transition-transform transform hover:scale-105"
+                >
+                  🖼️ {showImage ? 'ซ่อน' : 'แสดง'}
+                </button>
+                {/* --- 3. ลบการแสดงผลภาพออกจาก <td> นี้ --- */}
+              </td>
+              {isAdmin && (
+                <td className="p-3 text-center align-top">
+                  <button 
+                    onClick={() => onEdit(activity)} 
+                    className="text-yellow-600 hover:text-yellow-800 mr-2"
+                    title="แก้ไข"
+                  >
+                    ✏️
+                  </button>
+                  <button 
+                    onClick={() => onDelete(activity.id)} 
+                    className="text-red-600 hover:text-red-800"
+                    title="ลบ"
+                  >
+                    🗑️
+                  </button>
+                </td>
+              )}
+            </tr>
+            
+            {/* --- 4. แถวใหม่สำหรับแสดงภาพตัวอย่าง --- */}
+            {showImage && (
+              <tr className="border-b border-gray-300 bg-blue-50">
+                {/* ใช้ colSpan เพื่อให้ cell นี้ขยายเต็มความกว้างของตาราง */}
+                {/* --- 2. อัปเดต colSpan (Admin = 5, Home = 3) --- */}
+                <td colSpan={isAdmin ? 5 : 3} className="p-4 text-center">
+                  {imageUrl ? (
+                    <img 
+                      src={imageUrl} 
+                      alt={`ปก ${activity.name}`} 
+                      className="max-w-[400px] h-auto rounded-md mx-auto shadow-lg"
+                      onError={(e) => { e.target.src = 'https://placehold.co/400x400/E0F7FA/212121?text=Image+Error'; }}
+                    />
+                  ) : (
+                    <p className="text-gray-500">ไม่มีภาพปก</p>
+                  )}
+                </td>
+              </tr>
+            )}
+          </React.Fragment>
+        );
+      };
+
+      // Component: ตารางแสดงผล
+      const ActivitiesTable = ({ activities, isAdmin, onEdit, onDelete, loading }) => {
+        const [filterYear, setFilterYear] = useState("");
+        const [currentPage, setCurrentPage] = useState(1);
+
+        // 1. เรียงลำดับข้อมูล
+        const sortedActivities = useMemo(() => {
+          return [...activities].sort((a, b) => {
+            if (a.beYear !== b.beYear) {
+              return b.beYear - a.beYear; // ปี พ.ศ. มากไปน้อย
+            }
+            // ถ้าปี พ.ศ. เท่ากัน ให้เทียบวันที่
+            return new Date(b.date) - new Date(a.date); // วันที่ มากไปน้อย
+          });
+        }, [activities]);
+
+        // 2. กรองข้อมูล
+        const filteredActivities = useMemo(() => {
+          if (!filterYear) {
+            return sortedActivities;
+          }
+          return sortedActivities.filter(a => a.beYear.toString() === filterYear);
+        }, [sortedActivities, filterYear]);
+
+        // 3. แบ่งหน้า
+        const paginatedActivities = useMemo(() => {
+          const startIndex = (currentPage - 1) * ITEMS_PER_PAGE;
+          return filteredActivities.slice(startIndex, startIndex + ITEMS_PER_PAGE);
+        }, [filteredActivities, currentPage]);
+
+        const totalPages = Math.ceil(filteredActivities.length / ITEMS_PER_PAGE);
+
+        return (
+          <div className="w-full">
+            {/* ส่วนของการกรอง */}
+            <div className="mb-4 flex justify-end">
+              <label htmlFor="filterYear" className="mr-2 self-center">กรองตามปี พ.ศ.:</label>
+              <select
+                id="filterYear"
+                value={filterYear}
+                onChange={(e) => {
+                  setFilterYear(e.target.value);
+                  setCurrentPage(1); // Reset to first page on filter change
+                }}
+                className="p-2 border rounded-lg shadow-sm"
+              >
+                <option value="">ทั้งหมด</option>
+                {YEAR_OPTIONS.map(year => (
+                  <option key={year} value={year}>{year}</option>
+                ))}
+              </select>
+            </div>
+
+            {/* ตารางแสดงผล */}
+            <div className="overflow-x-auto bg-white rounded-lg shadow-md">
+              <table className="w-full min-w-max table-fixed">
+                <thead className="bg-blue-200">
+                  <tr className="text-gray-700">
+                    <th className="p-3 font-semibold text-center w-[170px] whitespace-nowrap">วันที่จัดกิจกรรม</th>
+                    {/* --- 3. ซ่อนคอลัมน์ 'ปี พ.ศ.' ถ้าไม่ใช่ Admin --- */}
+                    {isAdmin && <th className="p-3 font-semibold text-center w-[100px]">ปี พ.ศ.</th>}
+                    <th className="p-3 font-semibold text-center">ชื่อกิจกรรม</th>
+                    <th className="p-3 font-semibold text-center w-[150px]">ภาพหน้าปก</th>
+                    {isAdmin && <th className="p-3 font-semibold text-center w-[100px]">จัดการ</th>}
+                  </tr>
+                </thead>
+                <tbody>
+                  {loading ? (
+                    <tr>
+                      {/* --- 4. อัปเดต colSpan (Admin = 5, Home = 3) --- */}
+                      <td colSpan={isAdmin ? 5 : 3}>
+                        <LoadingSpinner />
+                      </td>
+                    </tr>
+                  ) : paginatedActivities.length === 0 ? (
+                    <tr>
+                      {/* --- 5. อัปเดต colSpan (Admin = 5, Home = 3) --- */}
+                      <td colSpan={isAdmin ? 5 : 3} className="p-5 text-center text-gray-500">
+                        😢 ไม่พบข้อมูลกิจกรรม
+                      </td>
+                    </tr>
+                  ) : (
+                    paginatedActivities.map(activity => (
+                      <ActivityRow
+                        key={activity.id}
+                        activity={activity}
+                        isAdmin={isAdmin}
+                        onEdit={onEdit}
+                        onDelete={onDelete}
+                      />
+                    ))
+                  )}
+                </tbody>
+              </table>
+            </div>
+
+            {/* ส่วนของการแบ่งหน้า */}
+            {totalPages > 1 && (
+              <div className="flex justify-between items-center mt-6">
+                <button
+                  onClick={() => setCurrentPage(p => Math.max(1, p - 1))}
+                  disabled={currentPage === 1}
+                  className="px-4 py-2 bg-white text-blue-600 rounded-lg shadow-md disabled:opacity-50 disabled:cursor-not-allowed hover:bg-gray-100"
+                >
+                  ⬅️ ก่อนหน้า
+                </button>
+                <span className="text-gray-700">
+                  หน้า {currentPage} / {totalPages}
+                </span>
+                <button
+                  onClick={() => setCurrentPage(p => Math.min(totalPages, p + 1))}
+                  disabled={currentPage === totalPages}
+                  className="px-4 py-2 bg-white text-blue-600 rounded-lg shadow-md disabled:opacity-50 disabled:cursor-not-allowed hover:bg-gray-100"
+                >
+                  ถัดไป ➡️
+                </button>
+              </div>
+            )}
+          </div>
+        );
+      };
+
+      // Component: ฟอร์มเพิ่ม/แก้ไข
+      const AddActivityForm = ({ onFormSubmit, existingData, clearEdit, setModal }) => {
+        const [date, setDate] = useState('');
+        const [beYear, setBeYear] = useState(CURRENT_BE_YEAR.toString());
+        const [name, setName] = useState('');
+        const [link, setLink] = useState('');
+        const [coverImage, setCoverImage] = useState(null);
+        const [imagePreview, setImagePreview] = useState(null);
+        const [formLoading, setFormLoading] = useState(false);
+
+        const isEditing = !!existingData;
+
+        useEffect(() => {
+          if (isEditing) {
+            setDate(existingData.date);
+            setBeYear(existingData.beYear.toString());
+            setName(existingData.name);
+            setLink(existingData.link);
+            setCoverImage(null); // Clear file input
+            setImagePreview(convertGoogleDriveUrl(existingData.coverImageUrl)); // Show existing image
+          } else {
+            // Reset form
+            setDate('');
+            setBeYear(CURRENT_BE_YEAR.toString());
+            setName('');
+            setLink('');
+            setCoverImage(null);
+            setImagePreview(null);
+          }
+        }, [existingData, isEditing]);
+
+        const handleDateChange = (e) => {
+          const newDate = e.target.value;
+          setDate(newDate);
+          // อัปเดตปี พ.ศ. อัตโนมัติ เมื่อเลือกวันที่
+          if (newDate) {
+            try {
+              const d = new Date(newDate);
+              const newBeYear = d.getFullYear() + 543;
+              setBeYear(newBeYear.toString());
+            } catch (error) {
+              // do nothing
+            }
+          }
+        };
+
+        const handleFileChange = (e) => {
+          const file = e.target.files[0];
+          if (file) {
+            setCoverImage(file);
+            // สร้าง preview
+            const reader = new FileReader();
+            reader.onloadend = () => {
+              setImagePreview(reader.result);
+            };
+            reader.readAsDataURL(file);
+          } else {
+            setCoverImage(null);
+            setImagePreview(isEditing ? convertGoogleDriveUrl(existingData.coverImageUrl) : null);
+          }
+        };
+
+        const handleSubmit = async (e) => {
+          e.preventDefault();
+          if (!date || !name || !link) {
+            setModal({
+              show: true,
+              title: 'ข้อมูลไม่ครบ',
+              text: 'กรุณากรอก วันที่, ชื่อกิจกรรม, และ Link',
+              icon: 'warning',
+              showConfirm: true,
+              showCancel: false,
+            });
+            return;
+          }
+
+          setFormLoading(true);
+          let coverImageBase64 = null;
+          let coverImageName = null;
+          let coverImageMimeType = null;
+
+          // ถ้ามีการเลือกไฟล์ใหม่ (ทั้งตอนเพิ่มและแก้ไข)
+          if (coverImage) {
+            try {
+              // 1. Resize
+              const resizedBase64 = await resizeImage(coverImage, 400, 400);
+              coverImageBase64 = resizedBase64;
+              coverImageName = coverImage.name;
+              coverImageMimeType = coverImage.type;
+            } catch (error) {
+              console.error("Image processing error:", error);
+              setModal({
+                show: true,
+                title: 'เกิดข้อผิดพลาด',
+                text: 'ไม่สามารถประมวลผลรูปภาพได้',
+                icon: 'error',
+                showConfirm: true,
+                showCancel: false,
+              });
+              setFormLoading(false);
+              return;
+            }
+          }
+
+          const formData = {
+            action: isEditing ? 'edit' : 'add',
+            id: isEditing ? existingData.id : null,
+            date,
+            beYear,
+            name,
+            link,
+            // ส่งข้อมูลรูปภาพเฉพาะเมื่อมีการอัพโหลดใหม่
+            ...(coverImageBase64 && {
+                coverImageBase64,
+                coverImageName,
+                coverImageMimeType
+            })
+          };
+          
+          // เรียก onFormSubmit (ซึ่งจะไปเรียก GAS)
+          await onFormSubmit(formData);
+          
+          setFormLoading(false);
+          if (!isEditing) {
+              // Reset form หลังเพิ่มสำเร็จ
+              setDate('');
+              setBeYear(CURRENT_BE_YEAR.toString());
+              setName('');
+              setLink('');
+              setCoverImage(null);
+              setImagePreview(null);
+              e.target.reset(); // เคลียร์ file input
+          }
+        };
+
+        return (
+          <form onSubmit={handleSubmit} className="p-6 bg-white rounded-lg shadow-md mb-8">
+            <h3 className="text-2xl font-semibold mb-6 text-blue-800">
+              {isEditing ? '✏️ แก้ไขข้อมูลกิจกรรม' : '✨ เพิ่มกิจกรรม/โครงการใหม่'}
+            </h3>
+            <div className="grid md:grid-cols-2 gap-6">
+              {/* Column 1 */}
+              <div>
+                <div className="mb-4">
+                  <label htmlFor="date" className="block text-gray-700 font-semibold mb-2">
+                    วันที่จัดกิจกรรม *
+                  </label>
+                  <input
+                    type="date"
+                    id="date"
+                    value={date}
+                    onChange={handleDateChange}
+                    className="w-full p-3 border rounded-lg shadow-sm focus:outline-none focus:ring-2 focus:ring-blue-500"
+                    required
+                  />
+                </div>
+                <div className="mb-4">
+                  <label htmlFor="beYear" className="block text-gray-700 font-semibold mb-2">
+                    ปี พ.ศ. *
+                  </label>
+                  <select
+                    id="beYear"
+                    value={beYear}
+                    onChange={(e) => setBeYear(e.target.value)}
+                    className="w-full p-3 border rounded-lg shadow-sm bg-white focus:outline-none focus:ring-2 focus:ring-blue-500"
+                    required
+                  >
+                    {YEAR_OPTIONS.map(year => (
+                      <option key={year} value={year}>{year}</option>
+                    ))}
+                  </select>
+                </div>
+                <div className="mb-4">
+                  <label htmlFor="name" className="block text-gray-700 font-semibold mb-2">
+                    ชื่อกิจกรรม *
+                  </label>
+                  <input
+                    type="text"
+                    id="name"
+                    value={name}
+                    onChange={(e) => setName(e.target.value)}
+                    className="w-full p-3 border rounded-lg shadow-sm focus:outline-none focus:ring-2 focus:ring-blue-500"
+                    placeholder="เช่น กิจกรรมวันไหว้ครู"
+                    required
+                  />
+                </div>
+                <div className="mb-4">
+                  <label htmlFor="link" className="block text-gray-700 font-semibold mb-2">
+                    Link กิจกรรม *
+                  </label>
+                  <input
+                    type="url"
+                    id="link"
+                    value={link}
+                    onChange={(e) => setLink(e.target.value)}
+                    className="w-full p-3 border rounded-lg shadow-sm focus:outline-none focus:ring-2 focus:ring-blue-500"
+                    placeholder="https://photos.google.com/..."
+                    required
+                  />
+                </div>
+              </div>
+              
+              {/* Column 2 - Image Upload */}
+              <div>
+                <label htmlFor="coverImage" className="block text-gray-700 font-semibold mb-2">
+                  ภาพหน้าปกอัลบั้ม {isEditing ? '(อัพโหลดใหม่ถ้าต้องการเปลี่ยน)' : ''}
+                </label>
+                <input
+                  type="file"
+                  id="coverImage"
+                  accept="image/png, image/jpeg, image/gif"
+                  onChange={handleFileChange}
+                  className="w-full p-2 border rounded-lg shadow-sm file:mr-4 file:py-2 file:px-4 file:rounded-full file:border-0 file:text-sm file:font-semibold file:bg-blue-100 file:text-blue-700 hover:file:bg-blue-200"
+                />
+                <p className="text-xs text-gray-500 mt-2">
+                  (ภาพจะถูกปรับขนาดเป็น 400x400px อัตโนมัติ)
+                </p>
+                {imagePreview && (
+                  <div className="mt-4 p-2 border rounded-lg bg-gray-100 flex flex-col justify-center items-center">
+                    <p className="text-sm font-semibold mb-2 w-full text-left">ตัวอย่างภาพ:</p>
+                    <img 
+                      src={imagePreview} 
+                      alt="ตัวอย่างหน้าปก" 
+                      className="w-full max-w-[400px] h-auto rounded-md shadow-md"
+                    />
+                  </div>
+                )}
+              </div>
+            </div>
+            
+            {/* Buttons */}
+            <div className="mt-8 flex items-center">
+              <button
+                type="submit"
+                disabled={formLoading}
+                className="px-6 py-3 bg-blue-600 text-white font-semibold rounded-lg shadow-md hover:bg-blue-700 focus:outline-none focus:ring-2 focus:ring-blue-500 focus:ring-opacity-50 transition-all disabled:bg-gray-400"
+              >
+                {formLoading ? (
+                  <div className="flex items-center">
+                    <div className="animate-spin rounded-full h-5 w-5 border-b-2 border-white mr-2"></div>
+                    กำลังบันทึก...
+                  </div>
+                ) : (
+                  isEditing ? 'บันทึกการแก้ไข' : 'เพิ่มกิจกรรม'
+                )}
+              </button>
+              {isEditing && (
+                <button
+                  type="button"
+                  onClick={clearEdit}
+                  className="ml-4 px-6 py-3 bg-gray-500 text-white font-semibold rounded-lg shadow-md hover:bg-gray-600 transition-all"
+                >
+                  ยกเลิกการแก้ไข
+                </button>
+              )}
+            </div>
+          </form>
+        );
+      };
+
+      // Component: หน้า Admin
+      const AdminPage = ({ activities, onFormSubmit, onDelete, reloadData, navigateToHome, loading, setModal }) => {
+        const [editingActivity, setEditingActivity] = useState(null);
+        // --- NEW: State for active tab ---
+        const [activeTab, setActiveTab] = useState('manage'); // 'manage' or 'info'
+
+        const handleEdit = (activity) => {
+          setEditingActivity(activity);
+          window.scrollTo(0, 0); // เลื่อนขึ้นบนสุด
+        };
+
+        const clearEdit = () => {
+          setEditingActivity(null);
+        };
+        
+        const handleSubmit = async (formData) => {
+          await onFormSubmit(formData);
+          // ถ้าเป็นการแก้ไข ให้ clear form
+          if (formData.action === 'edit') {
+            clearEdit();
+          }
+        };
+
+        return (
+          <div className="w-full">
+            <div className="flex justify-between items-center mb-6">
+              <h2 className="text-3xl font-bold text-gray-800">🔒 หน้าระบบจัดการ (Admin)</h2>
+              <button
+                onClick={navigateToHome}
+                className="text-3xl p-2 rounded-full hover:bg-blue-200 transition-colors"
+                title="กลับหน้าแรก"
+              >
+                🏠
+              </button>
+            </div>
+            
+            {/* --- NEW: Tab Navigation --- */}
+            <div className="flex border-b border-gray-300 mb-6">
+              <button 
+                className={`px-6 py-3 font-semibold transition-colors ${activeTab === 'manage' ? 'border-b-4 border-blue-600 text-blue-600' : 'text-gray-500 hover:text-gray-700'}`}
+                onClick={() => setActiveTab('manage')}
+              >
+                📋 จัดการกิจกรรม
+              </button>
+              <button 
+                className={`px-6 py-3 font-semibold transition-colors ${activeTab === 'info' ? 'border-b-4 border-blue-600 text-blue-600' : 'text-gray-500 hover:text-gray-700'}`}
+                onClick={() => setActiveTab('info')}
+              >
+                ℹ️ ข้อมูลระบบ
+              </button>
+            </div>
+
+            {/* --- NEW: Conditional Content for 'Manage' tab --- */}
+            {activeTab === 'manage' && (
+              <React.Fragment>
+                <AddActivityForm 
+                  onFormSubmit={handleSubmit} 
+                  existingData={editingActivity}
+                  clearEdit={clearEdit}
+                  setModal={setModal}
+                />
+                <hr className="my-8 border-gray-300" />
+                <h3 className="text-2xl font-semibold mb-6 text-gray-800">☰ รายการกิจกรรมทั้งหมด</h3>
+                {/* --- Button wrapper (REMOVED Google Sheet link) --- */}
+                <div className="flex flex-wrap gap-4 mb-4">
+                  <button
+                    onClick={reloadData}
+                    disabled={loading}
+                    className="px-4 py-2 bg-green-600 text-white font-semibold rounded-lg shadow-md hover:bg-green-700 disabled:bg-gray-400 transition-colors"
+                  >
+                    🔃 โหลดข้อมูลใหม่
+                  </button>
+                  {/* Link to database is now in the 'info' tab */}
+                </div>
+                <ActivitiesTable
+                  activities={activities}
+                  isAdmin={true}
+                  onEdit={handleEdit}
+                  onDelete={onDelete}
+                  loading={loading}
+                />
+              </React.Fragment>
+            )}
+
+            {/* --- NEW: Conditional Content for 'Info' tab --- */}
+            {activeTab === 'info' && (
+              <div className="bg-white p-6 md:p-8 rounded-lg shadow-md">
+                <h3 className="text-2xl font-semibold mb-6 text-blue-800">ℹ️ ข้อมูลระบบและฐานข้อมูล</h3>
+                <div className="space-y-6">
+                  
+                  {/* 1. Google Sheet Link */}
+                  <div>
+                    <label className="block text-md font-semibold text-gray-700 mb-2">Link ฐานข้อมูล (Google Sheet)</label>
+                    <a
+                      href="https://docs.google.com/spreadsheets/d/1LIGfe0tBa-GMHJhfIj0BicoPIzs6DcZq6KTkYzOQK_Q/edit?usp=sharing"
+                      target="_blank"
+                      rel="noopener noreferrer"
+                      className="px-5 py-2 bg-blue-600 text-white font-semibold rounded-lg shadow-md hover:bg-blue-700 transition-colors inline-flex items-center"
+                    >
+                      📊 เปิดฐานข้อมูล
+                    </a>
+                  </div>
+
+                  {/* 2. Creator Email */}
+                  <div>
+                    <label className="block text-md font-semibold text-gray-700 mb-2">อีเมลผู้สร้าง</label>
+                    <p className="text-gray-900 bg-gray-100 p-3 rounded-md font-mono break-words select-all">{`g4779pitakchaiph@kurupatana.ac.th`}</p>
+                  </div>
+                  
+                  {/* 3. Database Path */}
+                  <div>
+                    <label className="block text-md font-semibold text-gray-700 mb-2">ที่อยู่ฐานข้อมูล (Google Drive)</label>
+                    <p className="text-gray-900 bg-gray-100 p-3 rounded-md font-mono break-words select-all">{`/11-App Sheet/ระบบเก็บลิงค์ภาพกิจกรรมโรงเรียน ตปส/ระบบเก็บลิงค์ภาพกิจกรรมโรงเรียน ตปส V2`}</p>
+                  </div>
+
+                  {/* 4. Image Folder Path */}
+                  <div>
+                    <label className="block text-md font-semibold text-gray-700 mb-2">ที่อยู่โฟลเดอร์เก็บข้อมูล (Google Drive)</label>
+                    <p className="text-gray-900 bg-gray-100 p-3 rounded-md font-mono break-words select-all">{`/11-App Sheet/ระบบเก็บลิงค์ภาพกิจกรรมโรงเรียน ตปส/โฟลเดอร์เก็บข้อมูลภาพตัวอย่างลิงค์กิจกรรมโรงเรียน ตปส`}</p>
+                  </div>
+                  
+                </div>
+              </div>
+            )}
+          </div>
+        );
+      };
+
+      // Component: หน้าแรก
+      const HomePage = ({ activities, navigateToAdmin, reloadData, loading }) => {
+        
+        // --- Logic for Recent Activities Grid ---
+        const recentActivities = useMemo(() => {
+          return [...activities]
+            .filter(a => a.coverImageUrl) // เอาเฉพาะที่มีภาพปก
+            .sort((a, b) => {
+              // Sort newest first
+              if (a.beYear !== b.beYear) return b.beYear - a.beYear;
+              return new Date(b.date) - new Date(a.date);
+            })
+            .slice(0, 8); // เอา 8 รายการล่าสุด
+        }, [activities]);
+
+        return (
+          <div className="w-full">
+            <div className="flex justify-between items-center mb-6">
+              <h2 className="text-3xl font-bold text-gray-800">ประมวลภาพกิจกรรม/โครงการ</h2>
+              <button
+                onClick={navigateToAdmin}
+                className="text-3xl p-2 rounded-full hover:bg-blue-200 transition-colors"
+                title="เข้าระบบผู้ดูแล"
+              >
+                ⚙️
+              </button>
+            </div>
+            <p className="text-lg text-gray-700 mb-6">
+              โรงเรียนตระกาศประชาสามัคคี อ.กันทรลักษ์ จ.ศรีสะเกษ
+            </p>
+
+            {/* --- NEW: Recent Activities Grid --- */}
+            {loading && <LoadingSpinner />}
+            {!loading && recentActivities.length > 0 && (
+              <div className="mb-12">
+                <h3 className="text-2xl font-semibold mb-6 text-gray-800">✨ กิจกรรมล่าสุด</h3>
+                <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-6">
+                  {recentActivities.map(activity => (
+                    <ActivityCard key={activity.id} activity={activity} />
+                  ))}
+                </div>
+              </div>
+            )}
+            {/* --- END: New Section --- */}
+            
+            <hr className="my-8 border-gray-300" />
+            
+            <h3 className="text-2xl font-semibold mb-6 text-gray-800">☰ รายการทั้งหมด</h3>
+            
+            <button
+              onClick={reloadData}
+              disabled={loading}
+              className="mb-4 px-4 py-2 bg-green-500 text-white rounded-lg shadow-md hover:bg-green-600 disabled:bg-gray-400"
+            >
+              🔃 โหลดข้อมูลใหม่
+            </button>
+
+            <ActivitiesTable
+              activities={activities}
+              isAdmin={false}
+              loading={loading}
+            />
+          </div>
+        );
+      };
+
+      // Component: หน้า Login
+      const LoginPage = ({ onLogin }) => {
+        const [password, setPassword] = useState('');
+        const [loading, setLoading] = useState(false);
+
+        const handleSubmit = async (e) => {
+          e.preventDefault();
+          setLoading(true);
+          await onLogin(password);
+          setLoading(false);
+        };
+
+        return (
+          <div className="w-full max-w-sm mx-auto p-8 bg-white rounded-lg shadow-xl">
+            <h2 className="text-2xl font-bold text-center text-gray-800 mb-6">
+              🔒 ป้อนรหัสผ่านผู้ดูแล
+            </h2>
+            <form onSubmit={handleSubmit}>
+              <div className="mb-4">
+                <input
+                  type="password"
+                  value={password}
+                  onChange={(e) => setPassword(e.target.value)}
+                  className="w-full p-3 border rounded-lg shadow-sm focus:outline-none focus:ring-2 focus:ring-blue-500"
+                  placeholder="รหัสผ่าน"
+                />
+              </div>
+              <button
+                type="submit"
+                disabled={loading}
+                className="w-full px-6 py-3 bg-blue-600 text-white font-semibold rounded-lg shadow-md hover:bg-blue-700 focus:outline-none focus:ring-2 focus:ring-blue-500 focus:ring-opacity-50 transition-all disabled:bg-gray-400"
+              >
+                {loading ? 'กำลังตรวจสอบ...' : 'เข้าสู่ระบบ'}
+              </button>
+            </form>
+          </div>
+        );
+      };
+
+      // Component: Footer
+      const Footer = () => (
+        <footer className="w-full text-center p-6 mt-12 border-t border-blue-200">
+          <p className="text-sm text-gray-600">
+            © {new Date().getFullYear()} Link ประมวลภาพกิจกรรม/โครงการ — V.{new Date().getFullYear()}
+          </p>
+          <p className="text-xs text-gray-500 mt-1">
+            Powered by: Gemini AI (Initial Code Generation)
+          </p>
+           <p className="text-xs text-gray-500 mt-1">
+            Implemented & Authored by: นายพิทักษ์ชัย ผายบึงแก้ว
+          </p>
+        </footer>
+      );
+
+      // --- Main App Component ---
+      function App() {
+        const [page, setPage] = useState('home'); // 'home', 'login', 'admin'
+        const [isAuthenticated, setIsAuthenticated] = useState(false);
+        const [activities, setActivities] = useState([]);
+        const [loading, setLoading] = useState(true);
+        const [error, setError] = useState(null);
+        const [modal, setModal] = useState({ 
+          show: false, 
+          title: '', 
+          text: '', 
+          icon: 'info', 
+          onConfirm: null, 
+          onCancel: null, 
+          showConfirm: true, 
+          showCancel: false 
+        });
+        
+        // --- Data Fetching & Mutations ---
+
+        // โหลดข้อมูล
+        const fetchData = useCallback(async () => {
+          setLoading(true);
+          setError(null);
+          try {
+            const response = await fetch(`${GAS_URL}?action=fetch`, {
+              method: 'GET',
+              redirect: 'follow',
+            });
+            if (!response.ok) {
+              throw new Error(`Network response was not ok: ${response.statusText}`);
+            }
+            const result = await response.json();
+            if (result.success) {
+              setActivities(result.data);
+            } else {
+              throw new Error(result.message || 'Failed to fetch data');
+            }
+          } catch (err) {
+            console.error("Fetch error:", err);
+            setError(err.message);
+            setModal({
+              show: true,
+              title: 'เกิดข้อผิดพลาด',
+              text: `ไม่สามารถโหลดข้อมูลได้: ${err.message}`,
+              icon: 'error',
+              showConfirm: true,
+              showCancel: false,
+            });
+          } finally {
+            setLoading(false);
+          }
+        }, []);
+
+        // โหลดข้อมูลครั้งแรก
+        useEffect(() => {
+          fetchData();
+        }, [fetchData]);
+
+        // ตรวจสอบรหัสผ่าน
+        const handleLogin = async (password) => {
+          
+          // --- 1. ตรวจสอบแป้นพิมพ์ (Keyboard Layout Check) ---
+          // ตรวจสอบว่ารหัสผ่านเป็น A-Z, a-z, 0-9 และสัญลักษณ์พื้นฐาน (ASCII) หรือไม่
+          const isAscii = /^[ -~]+$/.test(password);
+
+          if (!password || !isAscii) {
+            setModal({
+              show: true,
+              title: 'รหัสผ่านไม่ถูกต้อง',
+              text: 'รหัสผ่านต้องเป็นภาษาอังกฤษ (ASCII) เท่านั้น กรุณาตรวจสอบแป้นพิมพ์ของคุณ',
+              icon: 'warning',
+              showConfirm: true,
+              showCancel: false,
+            });
+            return; // หยุดการทำงาน
+          }
+          // --- สิ้นสุดการตรวจสอบแป้นพิมพ์ ---
+
+          setLoading(true);
+          try {
+            const params = new URLSearchParams({
+              action: 'checkPassword',
+              password: password
+            });
+            
+            const response = await fetch(GAS_URL, {
+              method: 'POST',
+              body: params
+            });
+            
+            const result = await response.json();
+            
+            if (result.success) {
+              setIsAuthenticated(true);
+              setPage('admin');
+              
+              // --- 2. ลบการแจ้งเตือน "สำเร็จ" ---
+              // setModal({
+              //   show: true,
+              //   title: 'สำเร็จ!',
+              //   text: 'เข้าสู่ระบบผู้ดูแลสำเร็จ',
+              //   icon: 'success',
+              //   showConfirm: true,
+              //   showCancel: false,
+              // });
+            } else {
+              setModal({
+                show: true,
+                title: 'รหัสผ่านผิด',
+                text: 'รหัสผ่านไม่ถูกต้อง',
+                icon: 'error',
+                showConfirm: true,
+                showCancel: false,
+              });
+            }
+          } catch (err) {
+            console.error("Login error:", err);
+            setModal({
+              show: true,
+              title: 'เกิดข้อผิดพลาด',
+              text: `ไม่สามารถติดต่อเซิร์ฟเวอร์ได้: ${err.message}`,
+              icon: 'error',
+              showConfirm: true,
+              showCancel: false,
+            });
+          } finally {
+            setLoading(false);
+          }
+        };
+        
+        // ส่งข้อมูล (เพิ่ม/แก้ไข)
+        const handleSubmitForm = async (formData) => {
+          setLoading(true); // ใช้ loading state หลักแทน modal
+          try {
+            const params = new URLSearchParams();
+            for (const key in formData) {
+              if (formData[key] !== null) {
+                params.append(key, formData[key]);
+              }
+            }
+
+            const response = await fetch(GAS_URL, {
+              method: 'POST',
+              body: params
+            });
+
+            const result = await response.json();
+
+            if (result.success) {
+              setModal({
+                show: true,
+                title: 'สำเร็จ!',
+                text: 'บันทึกข้อมูลเรียบร้อยแล้ว',
+                icon: 'success',
+                showConfirm: true,
+                showCancel: false,
+              });
+              // โหลดข้อมูลใหม่
+              fetchData();
+            } else {
+              throw new Error(result.message || 'ไม่สามารถบันทึกข้อมูลได้');
+            }
+          } catch (err) {
+            console.error("Submit error:", err);
+            setModal({
+              show: true,
+              title: 'เกิดข้อผิดพลาด',
+              text: `ไม่สามารถบันทึกข้อมูลได้: ${err.message}`,
+              icon: 'error',
+              showConfirm: true,
+              showCancel: false,
+            });
+          } finally {
+            setLoading(false);
+          }
+        };
+
+        // ฟังก์ชันลบจริง (หลังจากยืนยัน)
+        const proceedWithDelete = async (id) => {
+          setLoading(true); // แสดง loading
+          try {
+            const params = new URLSearchParams({
+              action: 'delete',
+              id: id
+            });
+            
+            const response = await fetch(GAS_URL, {
+              method: 'POST',
+              body: params
+            });
+
+            const result = await response.json();
+
+            if (result.success) {
+              setModal({
+                show: true,
+                title: 'ลบสำเร็จ!',
+                text: 'กิจกรรมถูกลบแล้ว',
+                icon: 'success',
+                showConfirm: true,
+                showCancel: false,
+              });
+              // โหลดข้อมูลใหม่
+              fetchData();
+            } else {
+              throw new Error(result.message || 'ไม่สามารถลบข้อมูลได้');
+            }
+          } catch (err) {
+            console.error("Delete error:", err);
+            setModal({
+              show: true,
+              title: 'เกิดข้อผิดพลาด',
+              text: `ไม่สามารถลบข้อมูลได้: ${err.message}`,
+              icon: 'error',
+              showConfirm: true,
+              showCancel: false,
+            });
+          } finally {
+            setLoading(false);
+          }
+        };
+
+        // ลบข้อมูล (ขั้นแรก: แสดง modal ยืนยัน)
+        const handleDelete = (id) => {
+          setModal({
+            show: true,
+            title: 'แน่ใจหรือไม่?',
+            text: "คุณต้องการลบกิจกรรมนี้ใช่หรือไม่",
+            icon: 'warning',
+            showCancelButton: true,
+            showConfirm: true,
+            showCancel: true,
+            confirmButtonText: 'ใช่, ลบเลย!',
+            cancelButtonText: 'ยกเลิก',
+            onConfirm: () => proceedWithDelete(id),
+            onCancel: () => setModal({ show: false }),
+          });
+        };
+
+        // --- Navigation ---
+        const navigateToAdmin = () => {
+          if (isAuthenticated) {
+            setPage('admin');
+          } else {
+            setPage('login');
+          }
+        };
+
+        const navigateToHome = () => {
+          setPage('home');
+        };
+
+        // --- Render Logic ---
+        const renderPage = () => {
+          if (page === 'login') {
+            return <LoginPage onLogin={handleLogin} />;
+          }
+          if (page === 'admin' && isAuthenticated) {
+            return (
+              <AdminPage
+                activities={activities}
+                onFormSubmit={handleSubmitForm}
+                onDelete={handleDelete}
+                reloadData={fetchData}
+                navigateToHome={navigateToHome}
+                loading={loading}
+                setModal={setModal}
+              />
+            );
+          }
+          // Default to 'home'
+          return (
+            <HomePage
+              activities={activities}
+              navigateToAdmin={navigateToAdmin}
+              reloadData={fetchData}
+              loading={loading}
+            />
+          );
+        };
+
+        // --- App's main return ---
+        return (
+          <div 
+            className="flex flex-col min-h-screen" 
+            style={{ fontFamily: "'Sarabun'", backgroundColor: '#E0F7FA', color: '#212121' }}
+          >
+            <SimpleModal modal={modal} setModal={setModal} />
+            <main className="flex-grow container mx-auto px-4 py-8 md:py-12">
+              {renderPage()}
+            </main>
+            <Footer />
+          </div>
+        );
+      }
+
+      // --- 6. Mount the App ---
+      const container = document.getElementById('root');
+      const root = ReactDOM.createRoot(container);
+      root.render(<App />);
+
+    </script>
+
+</body>
+</html>
+
+
+
+
